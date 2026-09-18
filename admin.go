@@ -763,6 +763,7 @@ func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 
 		// Reset status to active and refresh token, but preserve usage/token statistics.
 		acc.Status = "active"
+		acc.CooldownCount = 0
 		if err := refreshAccountToken(acc); err != nil {
 			writeAPI(w, http.StatusInternalServerError, apiResponse{Error: tAPI(r, "reset_failed", err.Error())})
 			return

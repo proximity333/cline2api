@@ -700,6 +700,58 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 	return nil, nil, &freeModelUnavailableError{message: "no eligible accounts available for free models"}
 }
 
+// accountCooldownBackoff 是账号级冷却的退避序列：连续传输失败时逐级递增，
+// 避免单次网络抖动就把整个账号冷却 5 分钟。请求成功后计数清零。
+var accountCooldownBackoff = []time.Duration{
+	30 * time.Second,
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	30 * time.Minute,
+}
+
+// isRetryableTransportError 判断传输层错误是否值得原样重试一次。
+// 只重试明确的瞬时错误（超时、EOF），不重试任意错误，
+// 避免把请求量翻倍、也避免掩盖真实故障。
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// doUpstreamRequest 发送上游请求；遇到可重试的传输层错误时用同一 body 重试一次。
+func doUpstreamRequest(req *http.Request, bodyJSON []byte) (*http.Response, error) {
+	resp, err := httpClient.Do(req)
+	if err == nil || !isRetryableTransportError(err) {
+		return resp, err
+	}
+	log.Printf("  upstream transient error, retrying once: %v", err)
+	req.Body = io.NopCloser(bytes.NewReader(bodyJSON))
+	return httpClient.Do(req)
+}
+
+// coolDownAccount 按连续失败次数计算账号级冷却时长并落库。
+func coolDownAccount(acc *Account, err error) {
+	d := accountCooldownBackoff[len(accountCooldownBackoff)-1]
+	if acc.CooldownCount < len(accountCooldownBackoff) {
+		d = accountCooldownBackoff[acc.CooldownCount]
+	}
+	acc.CooldownCount++
+	acc.Status = "cooldown"
+	acc.CooldownUntil = time.Now().Add(d)
+	savePool()
+	log.Printf("account cooldown: account=%s for=%s (consecutive failures=%d) err=%v",
+		truncateEmail(acc.Email), d, acc.CooldownCount, err)
+}
+
 func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (*http.Response, *Account, error) {
 	token, err := ensureAccountToken(acc)
 	if err != nil {
@@ -730,11 +782,9 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
 		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := httpClient.Do(req)
+	resp, err := doUpstreamRequest(req, bodyJSON)
 	if err != nil {
-		acc.Status = "cooldown"
-		acc.CooldownUntil = time.Now().Add(5 * time.Minute)
-		savePool()
+		coolDownAccount(acc, fmt.Errorf("upstream request: %w", err))
 		return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("upstream request: %w", err)}
 	}
 
@@ -745,11 +795,9 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 			token = acc.AccessToken
 			req.Header = clineHeaders(token, sessionID)
 			req.Body = io.NopCloser(bytes.NewReader(bodyJSON))
-			resp, err = httpClient.Do(req)
+			resp, err = doUpstreamRequest(req, bodyJSON)
 			if err != nil {
-				acc.Status = "cooldown"
-				acc.CooldownUntil = time.Now().Add(5 * time.Minute)
-				savePool()
+				coolDownAccount(acc, fmt.Errorf("upstream retry: %w", err))
 				return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("upstream retry: %w", err)}
 			}
 			if resp.StatusCode == 401 {
@@ -786,6 +834,7 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 
 	acc.LastUsed = time.Now()
 	acc.UsageCount++
+	acc.CooldownCount = 0
 	savePool()
 	return resp, acc, nil
 }
@@ -800,20 +849,36 @@ type accountTestResult struct {
 	Error        string `json:"error,omitempty"`
 }
 
-// parseCooldownUntil 从 429 响应体中解析 "Try again in 1h 1m" 格式的等待时长，
-// 返回预计恢复时间；解析失败则回退到 1 小时后。
-var cooldownRe = regexp.MustCompile(`(?i)try\s+again\s+in\s+(\d+)\s*h?(?:\s*(\d+))?\s*m?`)
+// parseCooldownUntil 从 429 响应体中解析 "Try again in 1h 1m" / "Try again in 5m" /
+// "Try again in 90 seconds" / "1h1m" 等格式的等待时长，返回预计恢复时间；
+// 解析失败则回退到 1 小时后。各时间单位独立解析，因此「只有分钟」的文案不会被误当成小时。
+var (
+	cooldownWindowRe  = regexp.MustCompile(`(?i)try\s+again\s+in\s+([^}\n"']*)`)
+	cooldownHoursRe   = regexp.MustCompile(`(?i)(\d+)\s*(?:hours?|hrs?|h)`)
+	cooldownMinutesRe = regexp.MustCompile(`(?i)(\d+)\s*(?:minutes?|mins?|m)`)
+	cooldownSecondsRe = regexp.MustCompile(`(?i)(\d+)\s*(?:seconds?|secs?|s)`)
+)
+
+// firstUnitValue 返回 text 中第一个被 re 匹配到的数字，未匹配则为 0。
+func firstUnitValue(re *regexp.Regexp, text string) int {
+	m := re.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
 
 func parseCooldownUntil(body string) time.Time {
-	matches := cooldownRe.FindStringSubmatch(body)
-	if len(matches) >= 2 {
-		hours, _ := strconv.Atoi(matches[1])
-		minutes := 0
-		if len(matches) >= 3 && matches[2] != "" {
-			minutes, _ = strconv.Atoi(matches[2])
-		}
-		if hours > 0 || minutes > 0 {
-			return time.Now().Add(time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute)
+	if m := cooldownWindowRe.FindStringSubmatch(body); len(m) >= 2 {
+		window := m[1]
+		hours := firstUnitValue(cooldownHoursRe, window)
+		minutes := firstUnitValue(cooldownMinutesRe, window)
+		seconds := firstUnitValue(cooldownSecondsRe, window)
+		if hours > 0 || minutes > 0 || seconds > 0 {
+			return time.Now().Add(time.Duration(hours)*time.Hour +
+				time.Duration(minutes)*time.Minute +
+				time.Duration(seconds)*time.Second)
 		}
 	}
 	// 解析失败，回退 1 小时

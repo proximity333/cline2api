@@ -21,6 +21,9 @@ type Account struct {
 	ModelStats map[string]*ModelStat `json:"modelStats,omitempty"`
 	// ModelCooldowns 模型级冷却：modelID → 恢复时间（429 时记录，只暂停该模型）
 	ModelCooldowns map[string]time.Time `json:"modelCooldowns,omitempty"`
+
+	// CooldownCount 账号级连续传输失败次数，用于冷却时长指数退避；请求成功后清零。
+	CooldownCount int `json:"cooldownCount,omitempty"`
 }
 
 type Model struct {
